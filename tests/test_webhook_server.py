@@ -118,3 +118,71 @@ class TestEventNormalization:
 
         assert response.status_code == 200
         mock_forward.assert_not_called()
+
+
+class TestVoicemailEvent:
+    def test_voicemail_event_is_forwarded_with_transcription(self, client):
+        payload = {
+            "uuid": "evt-005",
+            "event": "/restapi/v1.0/account/~/extension/~/message-store/instant",
+            "timestamp": "2026-06-30T10:00:00.000Z",
+            "body": {
+                "id": "vm-msg-001",
+                "type": "VoiceMail",
+                "from": {"phoneNumber": "+15551112222"},
+                "to": [{"phoneNumber": "+15553334444"}],
+            },
+        }
+
+        mock_transcription = {
+            "transcription_status": "Completed",
+            "transcription_text": "Hi, this is John. Just calling to confirm my appointment on Friday.",
+            "from_number": "+15551112222",
+            "to_number": "+15553334444",
+            "duration_seconds": 12,
+            "timestamp": "2026-06-30T10:00:00.000Z",
+        }
+
+        with patch("webhook_server.get_auth", return_value=None), \
+             patch("webhook_server.get_voicemail_transcription", return_value=mock_transcription), \
+             patch.object(webhook_server, "_forward_to_crm") as mock_forward:
+            response = client.post("/webhook", json=payload, headers={"Event-Id": "evt-005"})
+
+        assert response.status_code == 200
+        forwarded = mock_forward.call_args[0][0]
+        assert forwarded["event_type"] == "voicemail"
+        assert forwarded["message_id"] == "vm-msg-001"
+        assert "John" in forwarded["crm_note"]
+        assert "appointment" in forwarded["crm_note"]
+
+    def test_voicemail_transcription_in_progress(self, client):
+        payload = {
+            "uuid": "evt-006",
+            "event": "/restapi/v1.0/account/~/extension/~/message-store/instant",
+            "timestamp": "2026-06-30T10:01:00.000Z",
+            "body": {
+                "id": "vm-msg-002",
+                "type": "VoiceMail",
+                "from": {"phoneNumber": "+15551112222"},
+                "to": [{"phoneNumber": "+15553334444"}],
+            },
+        }
+
+        mock_transcription = {
+            "transcription_status": "InProgress",
+            "transcription_text": None,
+            "from_number": "+15551112222",
+            "to_number": "+15553334444",
+            "duration_seconds": 8,
+            "timestamp": "2026-06-30T10:01:00.000Z",
+        }
+
+        with patch("webhook_server.get_auth", return_value=None), \
+             patch("webhook_server.get_voicemail_transcription", return_value=mock_transcription), \
+             patch.object(webhook_server, "_forward_to_crm") as mock_forward:
+            response = client.post("/webhook", json=payload, headers={"Event-Id": "evt-006"})
+
+        assert response.status_code == 200
+        forwarded = mock_forward.call_args[0][0]
+        assert forwarded["event_type"] == "voicemail"
+        assert "InProgress" in forwarded["crm_note"]

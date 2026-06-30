@@ -1,43 +1,48 @@
 """
-Webhook receiver: this is the piece that actually makes the CRM integration
-work. RingCentral pushes raw telephony/SMS events here; this normalizes
-them into a simple shape and forwards them to whatever CRM webhook endpoint
-is configured, so the CRM gets "call logged" / "text received" activity
-without anyone touching the RingCentral admin portal.
+Webhook receiver: receives RingCentral telephony, SMS, and voicemail events,
+normalizes them, and forwards to a CRM webhook endpoint.
 
-Three things this handles that are easy to get wrong on a first pass:
-
-1. Validation handshake: on subscription creation, RingCentral sends one
-   request carrying a `Validation-Token` header with no body. You must
-   echo that header back, or the subscription creation fails with
-   SUB-521 ("WebHook is not reachable").
-2. Deduplication: RingCentral states events may be delivered more than
-   once and may arrive out of order. We dedupe on event UUID with a
-   bounded in-memory set.
-3. No guaranteed delivery: RingCentral retries failed deliveries for 24
-   hours, but never guarantees every event arrives. A production version
-   of this should reconcile against the Call Log / Message Store APIs
-   periodically rather than trusting webhooks as the sole source of truth.
+Three things handled that are easy to get wrong:
+1. Validation handshake: echo Validation-Token header or get SUB-521.
+2. Deduplication: events may arrive more than once; dedupe on UUID.
+3. No guaranteed delivery: reconcile against Call Log / Message Store APIs
+   in production rather than trusting webhooks as sole source of truth.
 
 Reference: https://developers.ringcentral.com/guide/notifications/webhooks/creating-webhooks
 """
 
 import collections
 import os
+import sys
 
 import requests
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+
+load_dotenv()
+
+# Add src/ to path so sibling modules import cleanly
+sys.path.insert(0, os.path.dirname(__file__))
+
+from auth import RingCentralAuth
+from voicemail import format_as_crm_note, get_voicemail_transcription
 
 app = Flask(__name__)
 
 CRM_WEBHOOK_URL = os.environ.get("CRM_WEBHOOK_URL", "http://localhost:5001/crm-events")
 
-# Bounded dedup cache: holds the last N event UUIDs seen. A real deployment
-# would back this with Redis or a DB row with a unique constraint instead
-# of an in-memory deque, since this resets on every restart and doesn't
-# survive multiple server instances.
 _seen_event_ids = collections.deque(maxlen=2000)
 _seen_event_id_set = set()
+
+# Auth client reused across requests so tokens are cached
+_auth = None
+
+
+def get_auth():
+    global _auth
+    if _auth is None:
+        _auth = RingCentralAuth()
+    return _auth
 
 
 def _already_seen(event_id):
@@ -52,12 +57,9 @@ def _already_seen(event_id):
 
 
 def _normalize_telephony_event(body):
-    """Pulls the fields a CRM activity log actually needs out of a
-    telephony session event payload."""
     session = body.get("body", {})
     parties = session.get("parties", [])
     party = parties[0] if parties else {}
-
     return {
         "event_type": "call",
         "session_id": session.get("sessionId"),
@@ -70,9 +72,7 @@ def _normalize_telephony_event(body):
 
 
 def _normalize_sms_event(body):
-    """Pulls the fields needed to log an inbound text as a CRM activity."""
     message = body.get("body", {})
-
     return {
         "event_type": "sms",
         "message_id": message.get("id"),
@@ -83,18 +83,43 @@ def _normalize_sms_event(body):
     }
 
 
+def _normalize_voicemail_event(body):
+    """
+    Handles inbound voicemail events. Fetches the transcription from the
+    Message Store API and formats it as a CRM note. If transcription is
+    still in progress, logs a placeholder note so the CRM record still
+    gets created -- agent can check RingCentral for the full message.
+    """
+    message = body.get("body", {})
+    message_id = message.get("id")
+
+    try:
+        transcription = get_voicemail_transcription(get_auth(), message_id)
+        note = format_as_crm_note(transcription)
+    except Exception as exc:
+        app.logger.error("Failed to fetch voicemail transcription: %s", exc)
+        note = f"Voicemail received (message ID: {message_id}). Transcription unavailable -- check RingCentral."
+
+    return {
+        "event_type": "voicemail",
+        "message_id": message_id,
+        "from_number": (message.get("from") or {}).get("phoneNumber"),
+        "to_number": [t.get("phoneNumber") for t in message.get("to", [])],
+        "crm_note": note,
+        "timestamp": body.get("timestamp"),
+    }
+
+
 def _forward_to_crm(payload):
     try:
         requests.post(CRM_WEBHOOK_URL, json=payload, timeout=5)
     except requests.RequestException as exc:
-        # In production: push to a retry queue instead of dropping it.
         app.logger.error("Failed to forward event to CRM: %s", exc)
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Step 1: validation handshake. RingCentral sends this once when the
-    # subscription is first created, with no JSON body.
+    # Validation handshake
     validation_token = request.headers.get("Validation-Token")
     if validation_token:
         response = jsonify({})
@@ -108,11 +133,17 @@ def webhook():
         return jsonify({"status": "duplicate, ignored"}), 200
 
     event_path = body.get("event", "")
+    inner = body.get("body", {})
 
     if "telephony/sessions" in event_path:
         normalized = _normalize_telephony_event(body)
     elif "message-store" in event_path:
-        normalized = _normalize_sms_event(body)
+        # Differentiate voicemail from SMS by the type field in the body
+        msg_type = inner.get("type", "")
+        if msg_type == "VoiceMail":
+            normalized = _normalize_voicemail_event(body)
+        else:
+            normalized = _normalize_sms_event(body)
     else:
         return jsonify({"status": "unrecognized event type, ignored"}), 200
 
