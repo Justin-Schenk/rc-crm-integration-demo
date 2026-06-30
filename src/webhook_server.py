@@ -1,14 +1,13 @@
 """
 Webhook receiver: receives RingCentral telephony, SMS, and voicemail events,
-normalizes them, and forwards to a CRM webhook endpoint.
+normalizes them, looks up the contact in HubSpot by phone number, and logs
+the activity to their contact record automatically.
 
 Three things handled that are easy to get wrong:
 1. Validation handshake: echo Validation-Token header or get SUB-521.
 2. Deduplication: events may arrive more than once; dedupe on UUID.
 3. No guaranteed delivery: reconcile against Call Log / Message Store APIs
    in production rather than trusting webhooks as sole source of truth.
-
-Reference: https://developers.ringcentral.com/guide/notifications/webhooks/creating-webhooks
 """
 
 import collections
@@ -21,20 +20,17 @@ from flask import Flask, jsonify, request
 
 load_dotenv()
 
-# Add src/ to path so sibling modules import cleanly
 sys.path.insert(0, os.path.dirname(__file__))
 
 from auth import RingCentralAuth
 from voicemail import format_as_crm_note, get_voicemail_transcription
+from adapters import hubspot as crm
 
 app = Flask(__name__)
-
-CRM_WEBHOOK_URL = os.environ.get("CRM_WEBHOOK_URL", "http://localhost:5001/crm-events")
 
 _seen_event_ids = collections.deque(maxlen=2000)
 _seen_event_id_set = set()
 
-# Auth client reused across requests so tokens are cached
 _auth = None
 
 
@@ -84,12 +80,6 @@ def _normalize_sms_event(body):
 
 
 def _normalize_voicemail_event(body):
-    """
-    Handles inbound voicemail events. Fetches the transcription from the
-    Message Store API and formats it as a CRM note. If transcription is
-    still in progress, logs a placeholder note so the CRM record still
-    gets created -- agent can check RingCentral for the full message.
-    """
     message = body.get("body", {})
     message_id = message.get("id")
 
@@ -98,7 +88,7 @@ def _normalize_voicemail_event(body):
         note = format_as_crm_note(transcription)
     except Exception as exc:
         app.logger.error("Failed to fetch voicemail transcription: %s", exc)
-        note = f"Voicemail received (message ID: {message_id}). Transcription unavailable -- check RingCentral."
+        note = f"Voicemail received (message ID: {message_id}). Check RingCentral for full message."
 
     return {
         "event_type": "voicemail",
@@ -110,16 +100,29 @@ def _normalize_voicemail_event(body):
     }
 
 
-def _forward_to_crm(payload):
+def _process_event(event):
+    from_number = event.get("from_number")
+
+    if not from_number:
+        app.logger.warning("Event has no from_number, skipping CRM lookup")
+        return
+
     try:
-        requests.post(CRM_WEBHOOK_URL, json=payload, timeout=5)
-    except requests.RequestException as exc:
-        app.logger.error("Failed to forward event to CRM: %s", exc)
+        contact = crm.find_contact(from_number)
+
+        if not contact:
+            app.logger.info(f"No contact found for {from_number}, creating new contact")
+            contact = crm.create_contact_if_not_found(from_number, event)
+
+        crm.log_activity(contact["id"], event)
+        app.logger.info(f"Logged {event['event_type']} to HubSpot contact {contact['name']} ({contact['id']})")
+
+    except Exception as exc:
+        app.logger.error(f"Failed to log event to HubSpot: %s", exc)
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Validation handshake
     validation_token = request.headers.get("Validation-Token")
     if validation_token:
         response = jsonify({})
@@ -138,7 +141,6 @@ def webhook():
     if "telephony/sessions" in event_path:
         normalized = _normalize_telephony_event(body)
     elif "message-store" in event_path:
-        # Differentiate voicemail from SMS by the type field in the body
         msg_type = inner.get("type", "")
         if msg_type == "VoiceMail":
             normalized = _normalize_voicemail_event(body)
@@ -147,8 +149,8 @@ def webhook():
     else:
         return jsonify({"status": "unrecognized event type, ignored"}), 200
 
-    _forward_to_crm(normalized)
-    return jsonify({"status": "forwarded"}), 200
+    _process_event(normalized)
+    return jsonify({"status": "logged to HubSpot"}), 200
 
 
 if __name__ == "__main__":

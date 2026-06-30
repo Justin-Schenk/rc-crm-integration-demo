@@ -16,8 +16,7 @@ import requests
 # subscribing on behalf of a specific extension rather than '~' (current).
 EVENT_FILTERS = [
     "/restapi/v1.0/account/~/extension/~/telephony/sessions",
-    "/restapi/v1.0/account/~/extension/~/message-store/instant?type=SMS",
-    "/restapi/v1.0/account/~/extension/~/message-store/instant?type=VoiceMail",
+    "/restapi/v1.0/account/~/extension/~/message-store",
 ]
 
 
