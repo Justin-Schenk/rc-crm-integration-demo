@@ -40,8 +40,6 @@ def _get_headers():
 def _normalize_phone(phone_number):
     """
     Strip all non-numeric characters from a phone number for comparison.
-    HubSpot stores numbers in various formats -- (808) 866-6788, 8088666788,
-    +18088666788 -- so we strip formatting before comparing.
     """
     return re.sub(r"\D", "", phone_number or "")
 
